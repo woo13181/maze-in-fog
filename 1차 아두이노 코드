@@ -1,0 +1,291 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET 4
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define MAZE_SIZE 15
+char maze[MAZE_SIZE][MAZE_SIZE];
+
+#define JOY_X A0
+#define JOY_Y A1
+#define HINT_BUTTON_PIN 2
+#define RESET_BUTTON_PIN 3
+#define ESP32_WAKE_PIN 5  // Pin to send wake signal to ESP32
+#define BUZZER_PIN 8
+
+const int hpLeds[] = {9, 10, 11, 12, 13};
+const int maxHp = 5;
+
+int playerX = 1, playerY = 1;
+int oldX = 1, oldY = 1;
+int playerHp = 3;
+int hintCount = 2;
+int showMapTime = 5000;
+int fogRadius = 1;  // Controls fog size (0=1x1, 1=3x3, 2=5x5, etc.)
+bool isBlindMode = false;
+bool gameActive = false;
+bool lastMoveValid = true;  // Debounce wall collision
+
+void wakeEsp32() {
+  // Send a LOW pulse to ESP32 to wake it from deep sleep
+  pinMode(ESP32_WAKE_PIN, OUTPUT);
+  digitalWrite(ESP32_WAKE_PIN, LOW);
+  delay(100);
+  digitalWrite(ESP32_WAKE_PIN, HIGH);
+  pinMode(ESP32_WAKE_PIN, INPUT_PULLUP);
+  delay(500);  // Wait for ESP32 to wake and be ready
+}
+
+void selectDifficulty() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(5, 10);
+  display.println(F("Select Difficulty:"));
+  display.setCursor(5, 25);
+  display.println(F("Joystick Up/Down"));
+  display.setCursor(5, 40);
+  display.println(F("Press Hint to Start"));
+  display.display();
+
+  int selection = 2;
+  while (true) {
+    int yVal = analogRead(JOY_Y);
+    if (yVal < 200) {
+      selection = 1;
+      delay(200);
+    }
+    if (yVal > 800) {
+      selection = 3;
+      delay(200);
+    }
+
+    display.fillRect(5, 52, 120, 10, SSD1306_BLACK);
+    display.setCursor(5, 52);
+    if (selection == 1) display.println(F("> Easy (HP5, Hint3)"));
+    else if (selection == 2) display.println(F("> Normal (HP3, Hint2)"));
+    else display.println(F("> Hard (HP1, Hint1)"));
+    display.display();
+
+    if (digitalRead(HINT_BUTTON_PIN) == LOW) {
+      if (selection == 1) {
+        playerHp = 5;
+        hintCount = 3;
+        showMapTime = 7000;
+        fogRadius = 3;  // Easy: Large fog area (7x7)
+      } else if (selection == 2) {
+        playerHp = 3;
+        hintCount = 2;
+        showMapTime = 5000;
+        fogRadius = 1;  // Normal: Medium fog area (3x3)
+      } else {
+        playerHp = 1;
+        hintCount = 1;
+        showMapTime = 3000;
+        fogRadius = 0;  // Hard: Only see current cell (1x1)
+      }
+      break;
+    }
+    delay(50);
+  }
+}
+
+void updateHpLeds() {
+  for (int i = 0; i < maxHp; i++) {
+    if (i < playerHp) digitalWrite(hpLeds[i], HIGH);
+    else digitalWrite(hpLeds[i], LOW);
+  }
+}
+
+void drawFullMaze() {
+  display.clearDisplay();
+  for (int i = 0; i < MAZE_SIZE; i++) {
+    for (int j = 0; j < MAZE_SIZE; j++) {
+      if (maze[i][j] == '1') display.fillRect(j * 3, i * 3, 3, 3, SSD1306_WHITE);
+    }
+  }
+  display.fillRect(1 * 3, 1 * 3, 3, 3, SSD1306_WHITE);
+  display.drawRect((MAZE_SIZE - 2) * 3, (MAZE_SIZE - 2) * 3, 3, 3, SSD1306_WHITE);
+  display.fillCircle(playerX * 3 + 1, playerY * 3 + 1, 1, SSD1306_WHITE);
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(HINT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ESP32_WAKE_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  for (int i = 0; i < maxHp; i++) pinMode(hpLeds[i], OUTPUT);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+}
+
+void loop() {
+  // Check for reset button press
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    gameActive = false;
+    isBlindMode = false;
+    display.clearDisplay();
+    display.display();
+    playerHp = 0;
+    updateHpLeds();
+
+    // Send wake signal to ESP32 to generate new maze
+    wakeEsp32();
+    delay(500);
+  }
+
+  if (!gameActive) {
+    selectDifficulty();
+    updateHpLeds();
+
+    display.clearDisplay();
+    display.setCursor(15, 25);
+    display.println(F("Generating Maze..."));
+    display.display();
+
+    // Wake ESP32 and request maze generation
+    wakeEsp32();
+    Serial.print('G');
+    
+    // Wait for maze data with timeout
+    unsigned long startTime = millis();
+    while (!Serial.find("[") && (millis() - startTime < 5000)) {}
+    
+    if (millis() - startTime >= 5000) {
+      display.clearDisplay();
+      display.setCursor(10, 25);
+      display.println(F("ESP32 Timeout!"));
+      display.display();
+      delay(2000);
+      return;
+    }
+
+    // Read maze data
+    for (int i = 0; i < MAZE_SIZE; i++) {
+      for (int j = 0; j < MAZE_SIZE; j++) {
+        unsigned long readStart = millis();
+        while (Serial.available() == 0 && (millis() - readStart < 1000)) {}
+        if (Serial.available() > 0) {
+          maze[i][j] = Serial.read();
+        }
+      }
+    }
+    
+    while (!Serial.find("]")) {}
+
+    playerX = 1;
+    playerY = 1;
+    oldX = 1;
+    oldY = 1;
+    drawFullMaze();
+    delay(showMapTime);
+
+    isBlindMode = true;
+    gameActive = true;
+    display.clearDisplay();
+    display.display();
+  }
+
+  if (gameActive && isBlindMode) {
+    // Clear display each frame to prevent showing path
+    display.clearDisplay();
+    
+    // Dynamic fog effect - size depends on difficulty
+    for (int y = -fogRadius; y <= fogRadius; y++) {
+      for (int x = -fogRadius; x <= fogRadius; x++) {
+        int cx = playerX + x;
+        int cy = playerY + y;
+        if (cx >= 0 && cx < MAZE_SIZE && cy >= 0 && cy < MAZE_SIZE) {
+          if (maze[cy][cx] == '1') display.fillRect(cx * 3, cy * 3, 3, 3, SSD1306_WHITE);
+          else display.fillRect(cx * 3, cy * 3, 3, 3, SSD1306_BLACK);
+        }
+      }
+    }
+
+    // Draw player at center
+    display.fillCircle(playerX * 3 + 1, playerY * 3 + 1, 1, SSD1306_WHITE);
+
+    display.fillRect(60, 0, 68, 10, SSD1306_BLACK);
+    display.setCursor(65, 0);
+    display.print(F("Hint:"));
+    display.print(hintCount);
+    display.display();
+
+    int xVal = analogRead(JOY_X);
+    int yVal = analogRead(JOY_Y);
+    int nextX = playerX;
+    int nextY = playerY;
+
+    if (xVal < 200) nextX--;
+    else if (xVal > 800) nextX++;
+    else if (yVal < 200) nextY--;
+    else if (yVal > 800) nextY++;
+
+    if (nextX != playerX || nextY != playerY) {
+      if (maze[nextY][nextX] == '1') {
+        // Wall collision - only damage if we were moving toward an empty space last frame
+        if (lastMoveValid) {
+          playerHp--;
+          tone(BUZZER_PIN, 200, 150);
+          updateHpLeds();
+          lastMoveValid = false;
+          if (playerHp <= 0) {
+            display.clearDisplay();
+            display.setCursor(15, 25);
+            display.setTextSize(2);
+            display.println(F("GAME OVER"));
+            display.display();
+            for (int k = 0; k < 3; k++) {
+              for (int i = 0; i < maxHp; i++) digitalWrite(hpLeds[i], HIGH);
+              delay(150);
+              for (int i = 0; i < maxHp; i++) digitalWrite(hpLeds[i], LOW);
+              delay(150);
+            }
+            gameActive = false;
+          }
+        }
+        delay(200);
+      } else if (maze[nextY][nextX] == '3') {
+        // Goal reached - victory!
+        display.clearDisplay();
+        display.setCursor(20, 25);
+        display.setTextSize(2);
+        display.println(F("CLEAR!!!"));
+        display.display();
+        tone(BUZZER_PIN, 523, 100);
+        delay(100);
+        tone(BUZZER_PIN, 659, 100);
+        delay(100);
+        tone(BUZZER_PIN, 784, 300);
+        delay(2000);
+        gameActive = false;
+        lastMoveValid = true;
+      } else {
+        // Normal movement
+        playerX = nextX;
+        playerY = nextY;
+        lastMoveValid = true;
+        delay(150);
+      }
+    }
+
+    // Hint button - reveal full maze temporarily
+    if (digitalRead(HINT_BUTTON_PIN) == LOW && hintCount > 0) {
+      hintCount--;
+      drawFullMaze();
+      delay(1500);
+      display.clearDisplay();
+      display.display();
+    }
+  }
+}

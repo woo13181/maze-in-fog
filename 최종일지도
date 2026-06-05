@@ -157,11 +157,11 @@ void drawGameScreen() {
   unsigned long currentTime = (millis() - startTime) / 1000;
   
   display.setCursor(75, 0);
-  display.print(F("T:"));
+  display.print(F("TIME:"));
   display.println(currentTime);
 
   display.setCursor(75, 9);
-  display.print(F("H:"));
+  display.print(F("HINT:"));
   display.println(hintCount);
 
   display.display();

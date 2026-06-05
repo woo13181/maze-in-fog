@@ -1,6 +1,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -14,30 +15,253 @@ char maze[MAZE_SIZE][MAZE_SIZE];
 #define JOY_Y A1
 #define HINT_BUTTON_PIN 2
 #define RESET_BUTTON_PIN 3
-#define ESP32_WAKE_PIN 5  // Pin to send wake signal to ESP32
+#define ESP32_WAKE_PIN 5
 #define BUZZER_PIN 8
 
 const int hpLeds[] = {9, 10, 11, 12, 13};
 const int maxHp = 5;
+
+// 난이도: 0=Easy, 1=Normal, 2=Hard
+#define EASY 0
+#define NORMAL 1
+#define HARD 2
+#define NUM_RANKINGS 5
+#define EEPROM_START 0
+
+// 순위 기록 구조
+struct RankingEntry {
+  unsigned int time;  // 클리어 시간 (초)
+  char initials[4];   // 이름 3자 + 널 종료
+};
+
+// 각 난이도별 순위
+RankingEntry easyRankings[NUM_RANKINGS];
+RankingEntry normalRankings[NUM_RANKINGS];
+RankingEntry hardRankings[NUM_RANKINGS];
 
 int playerX = 1, playerY = 1;
 int oldX = 1, oldY = 1;
 int playerHp = 3;
 int hintCount = 2;
 int showMapTime = 5000;
-int fogRadius = 1;  // Controls fog size (0=1x1, 1=3x3, 2=5x5, etc.)
+int fogRadius = 1;
+int currentDifficulty = NORMAL;
 bool isBlindMode = false;
 bool gameActive = false;
-bool lastMoveValid = true;  // Debounce wall collision
+bool lastMoveValid = true;
+unsigned long startTime = 0;
+unsigned long clearTime = 0;
 
 void wakeEsp32() {
-  // Send a LOW pulse to ESP32 to wake it from deep sleep
   pinMode(ESP32_WAKE_PIN, OUTPUT);
   digitalWrite(ESP32_WAKE_PIN, LOW);
   delay(100);
   digitalWrite(ESP32_WAKE_PIN, HIGH);
   pinMode(ESP32_WAKE_PIN, INPUT_PULLUP);
-  delay(500);  // Wait for ESP32 to wake and be ready
+  delay(500);
+}
+
+// EEPROM에서 순위 데이터 읽기
+void loadRankings() {
+  int addr = EEPROM_START;
+  
+  // Easy 순위 읽기
+  for (int i = 0; i < NUM_RANKINGS; i++) {
+    easyRankings[i].time = (EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
+    for (int j = 0; j < 3; j++) {
+      easyRankings[i].initials[j] = EEPROM.read(addr + 2 + j);
+    }
+    easyRankings[i].initials[3] = '\0';
+    addr += 5;
+  }
+  
+  // Normal 순위 읽기
+  for (int i = 0; i < NUM_RANKINGS; i++) {
+    normalRankings[i].time = (EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
+    for (int j = 0; j < 3; j++) {
+      normalRankings[i].initials[j] = EEPROM.read(addr + 2 + j);
+    }
+    normalRankings[i].initials[3] = '\0';
+    addr += 5;
+  }
+  
+  // Hard 순위 읽기
+  for (int i = 0; i < NUM_RANKINGS; i++) {
+    hardRankings[i].time = (EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
+    for (int j = 0; j < 3; j++) {
+      hardRankings[i].initials[j] = EEPROM.read(addr + 2 + j);
+    }
+    hardRankings[i].initials[3] = '\0';
+    addr += 5;
+  }
+}
+
+// EEPROM에 순위 데이터 저장
+void saveRankings() {
+  int addr = EEPROM_START;
+  
+  // Easy 순위 저장
+  for (int i = 0; i < NUM_RANKINGS; i++) {
+    EEPROM.write(addr, (easyRankings[i].time >> 8) & 0xFF);
+    EEPROM.write(addr + 1, easyRankings[i].time & 0xFF);
+    for (int j = 0; j < 3; j++) {
+      EEPROM.write(addr + 2 + j, easyRankings[i].initials[j]);
+    }
+    addr += 5;
+  }
+  
+  // Normal 순위 저장
+  for (int i = 0; i < NUM_RANKINGS; i++) {
+    EEPROM.write(addr, (normalRankings[i].time >> 8) & 0xFF);
+    EEPROM.write(addr + 1, normalRankings[i].time & 0xFF);
+    for (int j = 0; j < 3; j++) {
+      EEPROM.write(addr + 2 + j, normalRankings[i].initials[j]);
+    }
+    addr += 5;
+  }
+  
+  // Hard 순위 저장
+  for (int i = 0; i < NUM_RANKINGS; i++) {
+    EEPROM.write(addr, (hardRankings[i].time >> 8) & 0xFF);
+    EEPROM.write(addr + 1, hardRankings[i].time & 0xFF);
+    for (int j = 0; j < 3; j++) {
+      EEPROM.write(addr + 2 + j, hardRankings[i].initials[j]);
+    }
+    addr += 5;
+  }
+}
+
+// 이름 입력받기 (조이스틱으로 선택)
+void getPlayerInitials(char* initials) {
+  char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  int pos = 0;  // 이름 위치
+  int selection = 0;  // 알파벳 선택
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(20, 10);
+  display.println(F("Enter Name:"));
+  display.display();
+  
+  while (pos < 3) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(20, 10);
+    display.println(F("Enter Name:"));
+    
+    // 현재 선택중인 알파벳 표시
+    display.setTextSize(2);
+    display.setCursor(40, 30);
+    display.print(alphabet[selection]);
+    
+    // 진행상황 표시
+    display.setTextSize(1);
+    display.setCursor(30, 50);
+    display.print(F("Pos: "));
+    display.print(pos + 1);
+    display.print(F("/3"));
+    
+    display.display();
+    
+    int yVal = analogRead(JOY_Y);
+    
+    if (yVal < 200) {
+      selection = (selection - 1 + 26) % 26;
+      delay(200);
+    } else if (yVal > 800) {
+      selection = (selection + 1) % 26;
+      delay(200);
+    }
+    
+    // 힌트 버튼으로 선택
+    if (digitalRead(HINT_BUTTON_PIN) == LOW) {
+      delay(200);
+      initials[pos] = alphabet[selection];
+      pos++;
+      selection = 0;
+    }
+    
+    delay(50);
+  }
+  initials[3] = '\0';
+}
+
+// 순위 리스트에 새 기록 추가
+void addRanking(unsigned int time, const char* initials, int difficulty) {
+  RankingEntry* rankingList;
+  
+  if (difficulty == EASY) rankingList = easyRankings;
+  else if (difficulty == NORMAL) rankingList = normalRankings;
+  else rankingList = hardRankings;
+  
+  // 5위 시간보다 나으면 추가
+  if (time < rankingList[NUM_RANKINGS - 1].time || rankingList[NUM_RANKINGS - 1].time == 0) {
+    // 삽입할 위치 찾기
+    int insertPos = NUM_RANKINGS - 1;
+    for (int i = 0; i < NUM_RANKINGS; i++) {
+      if (rankingList[i].time == 0 || time < rankingList[i].time) {
+        insertPos = i;
+        break;
+      }
+    }
+    
+    // 뒤로 밀어내기
+    for (int i = NUM_RANKINGS - 1; i > insertPos; i--) {
+      rankingList[i].time = rankingList[i - 1].time;
+      strcpy(rankingList[i].initials, rankingList[i - 1].initials);
+    }
+    
+    // 새 기록 삽입
+    rankingList[insertPos].time = time;
+    strcpy(rankingList[insertPos].initials, initials);
+    
+    saveRankings();
+  }
+}
+
+// 순위 표시
+void showRankings(int difficulty) {
+  RankingEntry* rankingList;
+  const char* difficultyName;
+  
+  if (difficulty == EASY) {
+    rankingList = easyRankings;
+    difficultyName = "EASY";
+  } else if (difficulty == NORMAL) {
+    rankingList = normalRankings;
+    difficultyName = "NORMAL";
+  } else {
+    rankingList = hardRankings;
+    difficultyName = "HARD";
+  }
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(35, 0);
+  display.print(difficultyName);
+  display.println(F(" RANKING"));
+  
+  display.setCursor(0, 12);
+  display.println(F("========================"));
+  
+  for (int i = 0; i < NUM_RANKINGS; i++) {
+    display.setCursor(0, 20 + i * 8);
+    display.print(i + 1);
+    display.print(F(". "));
+    
+    if (rankingList[i].time > 0) {
+      display.print(rankingList[i].initials);
+      display.print(F(" : "));
+      display.print(rankingList[i].time);
+      display.println(F("s"));
+    } else {
+      display.println(F("- : ---"));
+    }
+  }
+  
+  display.display();
+  delay(3000);
 }
 
 void selectDifficulty() {
@@ -45,50 +269,67 @@ void selectDifficulty() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(5, 10);
-  display.println(F("Select Difficulty:"));
+  display.println(F("Main Menu:"));
   display.setCursor(5, 25);
-  display.println(F("Joystick Up/Down"));
+  display.println(F("Up/Down - Select"));
   display.setCursor(5, 40);
-  display.println(F("Press Hint to Start"));
+  display.println(F("Hint - Start Game"));
   display.display();
 
   int selection = 2;
   while (true) {
     int yVal = analogRead(JOY_Y);
     if (yVal < 200) {
-      selection = 1;
-      delay(200);
+      selection--;
+      if (selection < 1) selection = 1;
+      delay(250);
     }
     else if (yVal > 800) {
-      selection = 3;
-      delay(200);
+      selection++;
+      if (selection > 4) selection = 4;
+      delay(250);
     }
 
     display.fillRect(5, 52, 120, 10, SSD1306_BLACK);
     display.setCursor(5, 52);
-    if (selection == 1) display.println(F("> Easy (HP5, Hint3)"));
-    else if (selection == 2) display.println(F("> Normal (HP3, Hint2)"));
-    else display.println(F("> Hard (HP1, Hint1)"));
+    if (selection == 1) display.println(F("> Easy"));
+    else if (selection == 2) display.println(F("> Normal"));
+    else if (selection == 3) display.println(F("> Hard"));
+    else display.println(F("> Rankings"));
     display.display();
 
     if (digitalRead(HINT_BUTTON_PIN) == LOW) {
+      delay(200);
       if (selection == 1) {
+        currentDifficulty = EASY;
         playerHp = 5;
         hintCount = 3;
         showMapTime = 7000;
-        fogRadius = 3;  // Easy: Large fog area (7x7)
+        fogRadius = 3;
+        break;
       } else if (selection == 2) {
+        currentDifficulty = NORMAL;
         playerHp = 3;
         hintCount = 2;
         showMapTime = 5000;
-        fogRadius = 1;  // Normal: Medium fog area (3x3)
-      } else {
+        fogRadius = 1;
+        break;
+      } else if (selection == 3) {
+        currentDifficulty = HARD;
         playerHp = 1;
         hintCount = 1;
         showMapTime = 3000;
-        fogRadius = 0;  // Hard: Only see current cell (1x1)
+        fogRadius = 0;
+        break;
+      } else {
+        // 순위 보기
+        showRankings(EASY);
+        showRankings(NORMAL);
+        showRankings(HARD);
+        display.clearDisplay();
+        display.display();
+        return;  // 다시 메인 메뉴로
       }
-      break;
     }
     delay(50);
   }
@@ -139,11 +380,15 @@ void setup() {
   }
   display.clearDisplay();
   display.display();
+  
+  // 순위 데이터 로드
+  loadRankings();
 }
 
 void loop() {
   // Check for reset button press
   if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    delay(200);
     gameActive = false;
     isBlindMode = false;
     display.clearDisplay();
@@ -151,7 +396,6 @@ void loop() {
     playerHp = 0;
     updateHpLeds();
 
-    // Send wake signal to ESP32 to generate new maze
     wakeEsp32();
     delay(500);
   }
@@ -165,15 +409,13 @@ void loop() {
     display.println(F("Generating Maze..."));
     display.display();
 
-    // Wake ESP32 and request maze generation
     wakeEsp32();
     Serial.print('G');
     
-    // Wait for maze data with timeout
-    unsigned long startTime = millis();
-    while (!Serial.find("[") && (millis() - startTime < 5000)) {}
+    unsigned long timeoutStart = millis();
+    while (!Serial.find("[") && (millis() - timeoutStart < 5000)) {}
     
-    if (millis() - startTime >= 5000) {
+    if (millis() - timeoutStart >= 5000) {
       display.clearDisplay();
       display.setCursor(10, 25);
       display.println(F("ESP32 Timeout!"));
@@ -182,7 +424,6 @@ void loop() {
       return;
     }
 
-    // Read maze data
     for (int i = 0; i < MAZE_SIZE; i++) {
       for (int j = 0; j < MAZE_SIZE; j++) {
         unsigned long readStart = millis();
@@ -200,20 +441,21 @@ void loop() {
     oldX = 1;
     oldY = 1;
     drawFullMaze();
-    blinkStartPoint(3);  // 시작점이 깜빡임
+    blinkStartPoint(3);
     delay(showMapTime);
 
     isBlindMode = true;
     gameActive = true;
     display.clearDisplay();
     display.display();
+    
+    startTime = millis();
   }
 
   if (gameActive && isBlindMode) {
-    // Clear display each frame to prevent showing path
     display.clearDisplay();
     
-    // Dynamic fog effect - size depends on difficulty
+    // Dynamic fog effect
     for (int y = -fogRadius; y <= fogRadius; y++) {
       for (int x = -fogRadius; x <= fogRadius; x++) {
         int cx = playerX + x;
@@ -225,13 +467,23 @@ void loop() {
       }
     }
 
-    // Draw player at center
     display.fillCircle(playerX * 3 + 1, playerY * 3 + 1, 1, SSD1306_WHITE);
 
-    display.fillRect(60, 0, 68, 10, SSD1306_BLACK);
-    display.setCursor(65, 0);
-    display.print(F("Hint:"));
-    display.print(hintCount);
+    unsigned long currentTime = (millis() - startTime) / 1000;
+    
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    
+    // 좌측 하단 - 시간
+    display.setCursor(0, 48);
+    display.print(F("T:"));
+    display.println(currentTime);
+    
+    // 우측 하단 - 힌트
+    display.setCursor(80, 48);
+    display.print(F("H:"));
+    display.println(hintCount);
+
     display.display();
 
     int xVal = analogRead(JOY_X);
@@ -246,7 +498,6 @@ void loop() {
 
     if (nextX != playerX || nextY != playerY) {
       if (maze[nextY][nextX] == '1') {
-        // Wall collision - only damage if we were moving toward an empty space last frame
         if (lastMoveValid) {
           playerHp--;
           tone(BUZZER_PIN, 200, 150);
@@ -269,7 +520,8 @@ void loop() {
         }
         delay(200);
       } else if (maze[nextY][nextX] == '3') {
-        // Goal reached - victory!
+        // 골 도달 - 클리어!
+        clearTime = (millis() - startTime) / 1000;
         display.clearDisplay();
         display.setCursor(20, 25);
         display.setTextSize(2);
@@ -280,11 +532,30 @@ void loop() {
         tone(BUZZER_PIN, 659, 100);
         delay(100);
         tone(BUZZER_PIN, 784, 300);
+        delay(1000);
+        
+        // 이름 입력
+        char playerName[4];
+        getPlayerInitials(playerName);
+        
+        // 순위에 추가
+        addRanking(clearTime, playerName, currentDifficulty);
+        
+        // 순위 표시
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(10, 10);
+        display.println(F("Time: "));
+        display.print(clearTime);
+        display.println(F(" sec"));
+        display.setCursor(10, 30);
+        display.println(F("Saved to Rankings!"));
+        display.display();
         delay(2000);
+        
         gameActive = false;
         lastMoveValid = true;
       } else {
-        // Normal movement
         playerX = nextX;
         playerY = nextY;
         lastMoveValid = true;
@@ -292,8 +563,9 @@ void loop() {
       }
     }
 
-    // Hint button - reveal full maze temporarily
+    // Hint button
     if (digitalRead(HINT_BUTTON_PIN) == LOW && hintCount > 0) {
+      delay(200);
       hintCount--;
       drawFullMaze();
       delay(1500);

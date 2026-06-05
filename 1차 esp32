@@ -1,0 +1,78 @@
+#include <Arduino.h>
+#include <esp_sleep.h>
+
+#define MAZE_SIZE 15
+#define WAKE_PIN GPIO_NUM_2  // Connected to Arduino Uno Pin 3
+
+int maze[MAZE_SIZE][MAZE_SIZE];
+int dx[] = {0, 0, -2, 2};
+int dy[] = {-2, 2, 0, 0};
+
+void initMaze() {
+  for (int i = 0; i < MAZE_SIZE; i++) {
+    for (int j = 0; j < MAZE_SIZE; j++) maze[i][j] = 1;
+  }
+}
+
+void generateMaze(int cx, int cy) {
+  maze[cy][cx] = 0;
+  int dirs[] = {0, 1, 2, 3};
+  for (int i = 0; i < 4; i++) {
+    int r = random(4);
+    int temp = dirs[i]; dirs[i] = dirs[r]; dirs[r] = temp;
+  }
+  for (int i = 0; i < 4; i++) {
+    int nx = cx + dx[dirs[i]];
+    int ny = cy + dy[dirs[i]];
+    if (nx > 0 && nx < MAZE_SIZE - 1 && ny > 0 && ny < MAZE_SIZE - 1) {
+      if (maze[ny][nx] == 1) {
+        maze[cy + dy[dirs[i]] / 2][cx + dx[dirs[i]] / 2] = 0;
+        generateMaze(nx, ny);
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  randomSeed(analogRead(0));
+  
+  // Set up external interrupt for wake-up
+  pinMode(WAKE_PIN, INPUT_PULLUP);
+  esp_sleep_enable_ext0_wakeup(WAKE_PIN, 0);  // Wake on LOW signal
+  
+  Serial.println("ESP32 ready, waiting for maze request...");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+    if (command == 'G') {
+      Serial.println("Generating new maze...");
+      
+      // Generate maze
+      initMaze();
+      generateMaze(1, 1);
+      maze[1][1] = 2;
+      maze[MAZE_SIZE - 2][MAZE_SIZE - 2] = 3;
+
+      // Send maze - using ASCII characters ('0', '1', '2', '3')
+      Serial.print('['); 
+      for (int i = 0; i < MAZE_SIZE; i++) {
+        for (int j = 0; j < MAZE_SIZE; j++) {
+          Serial.write('0' + maze[i][j]);
+        }
+      }
+      Serial.println(']');
+      Serial.flush();
+      
+      Serial.println("Maze sent. ESP32 entering deep sleep...");
+      delay(100);
+      
+      // Enter deep sleep - wakes only when Arduino Uno sends reset signal
+      esp_deep_sleep_start();
+    }
+  }
+  
+  delay(10);  // Small delay to prevent watchdog issues
+}

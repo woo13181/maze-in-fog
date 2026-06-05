@@ -114,6 +114,18 @@ void drawFullMaze() {
   display.display();
 }
 
+void blinkStartPoint(int times) {
+  for (int k = 0; k < times; k++) {
+    display.fillRect(1 * 3, 1 * 3, 3, 3, SSD1306_BLACK);
+    display.display();
+    delay(250);
+
+    display.fillRect(1 * 3, 1 * 3, 3, 3, SSD1306_WHITE);
+    display.display();
+    delay(250);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(HINT_BUTTON_PIN, INPUT_PULLUP);
@@ -188,6 +200,7 @@ void loop() {
     oldX = 1;
     oldY = 1;
     drawFullMaze();
+    blinkStartPoint(3);  // 시작점이 깜빡임
     delay(showMapTime);
 
     isBlindMode = true;

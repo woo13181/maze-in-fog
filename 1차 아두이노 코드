@@ -59,7 +59,7 @@ void selectDifficulty() {
       selection = 1;
       delay(200);
     }
-    if (yVal > 800) {
+    else if (yVal > 800) {
       selection = 3;
       delay(200);
     }

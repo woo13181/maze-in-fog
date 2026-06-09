@@ -1,0 +1,516 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET 4
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define MAZE_SIZE 15
+char maze[MAZE_SIZE][MAZE_SIZE];
+
+#define JOY_X A0
+#define JOY_Y A1
+#define HINT_BUTTON_PIN 2
+#define RESET_BUTTON_PIN 3
+#define ESP32_WAKE_PIN 5
+#define BUZZER_PIN 8
+
+const int hpLeds[] = {9, 10, 11, 12, 13};
+const int maxHp = 5;
+
+int playerX = 1, playerY = 1;
+int oldX = 1, oldY = 1;
+int playerHp = 3;
+int hintCount = 2;
+int showMapTime = 5000;
+int fogRadius = 1;
+bool isBlindMode = false;
+bool isUltraMode = false;
+bool gameActive = false;
+bool lastMoveValid = true;
+bool mazeGenerated = false;  // 미로 생성 여부 플래그 추가
+unsigned long startTime = 0;
+unsigned long clearTime = 0;
+unsigned long lastMoveTime = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastTimeUpdate = 0;
+unsigned long timeLimit = 0;  // 시간 제한 (밀리초)
+
+// 재시도 시 난이도별 설정 저장
+int savedHp = 3;
+int savedHintCount = 2;
+bool savedUltraMode = false;
+
+#define MOVE_DELAY 150
+#define DISPLAY_UPDATE_DELAY 100
+#define TIME_UPDATE_DELAY 500
+
+void wakeEsp32() {
+  pinMode(ESP32_WAKE_PIN, OUTPUT);
+  digitalWrite(ESP32_WAKE_PIN, LOW);
+  delay(100);
+  digitalWrite(ESP32_WAKE_PIN, HIGH);
+  pinMode(ESP32_WAKE_PIN, INPUT_PULLUP);
+  delay(500);
+}
+
+void selectDifficulty() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(5, 10);
+  display.println(F("Select Difficulty:"));
+  display.setCursor(5, 25);
+  display.println(F("Joystick Up/Down"));
+  display.setCursor(5, 40);
+  display.println(F("Press Hint to Start"));
+  display.display();
+
+  int selection = 2;
+  unsigned long lastInputTime = 0;
+
+  while (true) {
+    unsigned long currentTime = millis();
+    
+    // 입력 디바운싱
+    if (currentTime - lastInputTime > 250) {
+      int yVal = analogRead(JOY_Y);
+
+      if (yVal < 200) {
+        selection--;
+        if (selection < 1) selection = 1;
+        lastInputTime = currentTime;
+      }
+
+      if (yVal > 800) {
+        selection++;
+        if (selection > 5) selection = 5;
+        lastInputTime = currentTime;
+      }
+    }
+
+    display.fillRect(5, 52, 120, 10, SSD1306_BLACK);
+    display.setCursor(5, 52);
+    if (selection == 1) display.println(F("> Easy (HP5, Hint3)"));
+    else if (selection == 2) display.println(F("> Normal (HP3, Hint2)"));
+    else if (selection == 3) display.println(F("> Hard (HP1, Hint1)"));
+    else if (selection == 4)
+      display.println(F("> Ultra (HP1, Hint5)"));
+    else
+      display.println(F("> Extreme (HP1, Hint0)"));
+    display.display();
+
+    if (digitalRead(HINT_BUTTON_PIN) == HIGH) {
+      delay(200); // 버튼 디바운싱
+      if (selection == 1) {
+        playerHp = 5;
+        hintCount = 3;
+        showMapTime = 7000;
+        timeLimit = 120000;  // 120초
+        isUltraMode = false;
+      } else if (selection == 2) {
+        playerHp = 3;
+        hintCount = 2;
+        showMapTime = 5000;
+        timeLimit = 90000;   // 90초
+        isUltraMode = false;
+      } else if (selection == 3) {
+        playerHp = 1;
+        hintCount = 1;
+        showMapTime = 3000;
+        timeLimit = 60000;   // 60초
+        isUltraMode = false;
+      } else if (selection == 4) {
+        playerHp = 1;
+        hintCount = 5;
+        showMapTime = 2000;
+        timeLimit = 45000;   // 45초
+        isUltraMode = true;
+      } else {
+        playerHp = 1;
+        hintCount = 0;
+        showMapTime = 2000;
+        timeLimit = 30000;   // 30초
+        isUltraMode = true;
+      }
+      
+      // 난이도 설정 저장
+      savedHp = playerHp;
+      savedHintCount = hintCount;
+      savedUltraMode = isUltraMode;
+      
+      break;
+    }
+    delay(50);
+  }
+}
+
+void updateHpLeds() {
+  for (int i = 0; i < maxHp; i++) {
+    if (i < playerHp) digitalWrite(hpLeds[i], HIGH);
+    else digitalWrite(hpLeds[i], LOW);
+  }
+}
+
+void drawFullMaze() {
+  display.clearDisplay();
+  for (int i = 0; i < MAZE_SIZE; i++) {
+    for (int j = 0; j < MAZE_SIZE; j++) {
+      if (maze[i][j] == '1') display.fillRect(j * 4, i * 4, 4, 4, SSD1306_WHITE);
+    }
+  }
+  display.drawRect(1 * 4, 1 * 4, 4, 4, SSD1306_WHITE);
+  display.drawRect((MAZE_SIZE - 2) * 4, (MAZE_SIZE - 2) * 4, 4, 4, SSD1306_WHITE);
+  display.fillCircle(playerX * 4 + 2, playerY * 4 + 2, 3, SSD1306_WHITE);
+  display.display();
+}
+
+void drawGameScreen() {
+  // 화면 초기화
+  display.clearDisplay();
+  
+  // 3x3 fog effect
+  for (int y = -1; y <= 1; y++) {
+    for (int x = -1; x <= 1; x++) {
+      int cx = playerX + x;
+      int cy = playerY + y;
+      if (cx >= 0 && cx < MAZE_SIZE && cy >= 0 && cy < MAZE_SIZE) {
+        if (maze[cy][cx] == '1') display.fillRect(cx * 4, cy * 4, 4, 4, SSD1306_WHITE);
+        else display.fillRect(cx * 4, cy * 4, 4, 4, SSD1306_BLACK);
+      }
+    }
+  }
+
+  // 플레이어 그리기
+  display.fillCircle(playerX * 4 + 2, playerY * 4 + 2, 1, SSD1306_WHITE);
+
+  // 정보 영역 (우측 상단)
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  unsigned long remainingTime = (timeLimit - (millis() - startTime)) / 1000;
+  
+  display.setCursor(75, 0);
+  display.print(F("Time:"));
+  display.println(remainingTime);
+
+  display.setCursor(75, 9);
+  display.print(F("Hint:"));
+  display.println(hintCount);
+
+  display.setCursor(75, 20);
+  display.print(F("HP:"));
+  display.print(playerHp);
+
+  display.display();
+}
+
+void drawUltraMode() {
+  // ULTRA 모드: 캐릭터만 보이고 나머지는 검은색 (완전 암흑)
+  display.clearDisplay();
+  
+  // 플레이어만 그리기
+  display.fillCircle(playerX * 4 + 2, playerY * 4 + 2, 2, SSD1306_WHITE);
+
+  // 정보 영역 (우측 상단)
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  unsigned long remainingTime = (timeLimit - (millis() - startTime)) / 1000;
+  
+  display.setCursor(75, 0);
+  display.print(F("Time:"));
+  display.println(remainingTime);
+
+  display.display();
+}
+
+// 재시도 여부 선택 메뉴
+bool showRetryMenu() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 10);
+  display.println(F("RETRY?"));
+  display.setTextSize(1);
+  display.setCursor(5, 40);
+  display.println(F("YES: Hint Button"));
+  display.setCursor(5, 50);
+  display.println(F("NO: Reset Button"));
+  display.display();
+
+  while (true) {
+    if (digitalRead(HINT_BUTTON_PIN) == HIGH) {
+      delay(300);
+      return true;  // 같은 맵으로 재시작
+    }
+    if (digitalRead(RESET_BUTTON_PIN) == HIGH) {
+      delay(300);
+      return false; // 메인 메뉴로 돌아가기
+    }
+    delay(50);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(HINT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ESP32_WAKE_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  for (int i = 0; i < maxHp; i++) pinMode(hpLeds[i], OUTPUT);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+}
+
+void blinkPlayerStart(bool visible) {
+  int cx = playerX * 4 + 2;
+  int cy = playerY * 4 + 2;
+  int color = visible ? SSD1306_WHITE : SSD1306_BLACK;
+
+  display.drawLine(cx - 1, cy - 1, cx + 1, cy + 1, color);
+  display.drawLine(cx + 1, cy - 1, cx - 1, cy + 1, color);
+  display.display();
+}
+
+void loop() {
+  unsigned long now = millis();
+  
+  // 리셋 버튼 체크
+  if (digitalRead(RESET_BUTTON_PIN) == HIGH) {
+    delay(200);
+    gameActive = false;
+    isBlindMode = false;
+    isUltraMode = false;
+    mazeGenerated = false;  // 미로 재생성 플래그 리셋
+    display.clearDisplay();
+    display.display();
+    playerHp = 0;
+    updateHpLeds();
+    wakeEsp32();
+    delay(500);
+  }
+
+  if (!gameActive) {
+    // 미로가 아직 생성되지 않았을 때만 difficulty 선택 및 미로 생성
+    if (!mazeGenerated) {
+      selectDifficulty();
+      updateHpLeds();
+
+      display.clearDisplay();
+      display.setCursor(15, 25);
+      display.println(F("Generating Maze..."));
+      display.display();
+
+      wakeEsp32();
+      Serial.print('G');
+      
+      unsigned long timeoutStart = millis();
+      while (!Serial.find("[") && (millis() - timeoutStart < 5000)) {}
+      
+      if (millis() - timeoutStart >= 5000) {
+        display.clearDisplay();
+        display.setCursor(10, 25);
+        display.println(F("ESP32 Timeout!"));
+        display.display();
+        delay(2000);
+        mazeGenerated = false; // 실패 시 재생성 가능하도록
+        return;
+      }
+
+      // 미로 데이터 읽기
+      for (int i = 0; i < MAZE_SIZE; i++) {
+        for (int j = 0; j < MAZE_SIZE; j++) {
+          unsigned long readStart = millis();
+          while (Serial.available() == 0 && (millis() - readStart < 1000)) {}
+          if (Serial.available() > 0) {
+            maze[i][j] = Serial.read();
+          }
+        }
+      }
+      
+      while (!Serial.find("]")) {}
+      
+      mazeGenerated = true; // 미로 생성 완료
+    }
+
+    // 플레이어 위치 리셋 (재시도할 때도 실행)
+    playerX = 1;
+    playerY = 1;
+    oldX = 1;
+    oldY = 1;
+    clearTime = 0;
+    startTime = 0;
+
+    drawFullMaze();
+
+    unsigned long start = millis();
+    bool visible = true;
+
+    while (millis() - start < showMapTime) {
+      blinkPlayerStart(visible);
+      visible = !visible;
+      delay(250);
+    }
+
+    display.clearDisplay();
+    display.display();
+
+    startTime = millis();
+    lastMoveTime = millis();
+    lastDisplayUpdate = millis();
+    lastTimeUpdate = millis();
+
+    isBlindMode = true;
+    gameActive = true;
+  }
+
+  if (gameActive && isBlindMode) {
+    // 시간 초과 체크
+    if (millis() - startTime > timeLimit) {
+      display.clearDisplay();
+      display.setCursor(10, 20);
+      display.setTextSize(2);
+      display.println(F("TIME OVER"));
+      display.setTextSize(1);
+      display.setCursor(20, 50);
+      display.println(F("Game Over!"));
+      display.display();
+      
+      for (int k = 0; k < 3; k++) {
+        for (int i = 0; i < maxHp; i++) digitalWrite(hpLeds[i], HIGH);
+        delay(150);
+        for (int i = 0; i < maxHp; i++) digitalWrite(hpLeds[i], LOW);
+        delay(150);
+      }
+      gameActive = false;
+      delay(1500);
+      
+      // 재시도 메뉴 표시
+      if (showRetryMenu()) {
+        // 같은 맵으로 재시작 (새 미로 생성 안함)
+        playerHp = savedHp;
+        hintCount = savedHintCount;
+        isUltraMode = savedUltraMode;
+        updateHpLeds();
+      } else {
+        // 메인 메뉴로 돌아가기
+        mazeGenerated = false;
+      }
+      return;
+    }
+
+    // 화면 업데이트 (100ms마다)
+    if (now - lastDisplayUpdate > DISPLAY_UPDATE_DELAY) {
+      if (isUltraMode) {
+        drawUltraMode();
+      } else {
+        drawGameScreen();
+      }
+      lastDisplayUpdate = now;
+    }
+
+    // 조이스틱 입력 처리 (150ms 디바운싱)
+    if (now - lastMoveTime > MOVE_DELAY) {
+      int xVal = analogRead(JOY_X);
+      int yVal = analogRead(JOY_Y);
+      int nextX = playerX;
+      int nextY = playerY;
+
+      if (xVal < 200) nextX--;
+      else if (xVal > 800) nextX++;
+      else if (yVal < 200) nextY--;
+      else if (yVal > 800) nextY++;
+
+      if ((nextX != playerX || nextY != playerY) && nextX >= 0 && nextX < MAZE_SIZE && nextY >= 0 && nextY < MAZE_SIZE) {
+        if (maze[nextY][nextX] == '1') {
+          // 벽 충돌
+          playerHp--;
+          tone(BUZZER_PIN, 200, 150);
+          updateHpLeds();
+
+          if (playerHp <= 0) {
+            display.clearDisplay();
+            display.setCursor(15, 25);
+            display.setTextSize(2);
+            display.println(F("GAME OVER"));
+            display.display();
+            for (int k = 0; k < 3; k++) {
+              for (int i = 0; i < maxHp; i++) digitalWrite(hpLeds[i], HIGH);
+              delay(150);
+              for (int i = 0; i < maxHp; i++) digitalWrite(hpLeds[i], LOW);
+              delay(150);
+            }
+            gameActive = false;
+            delay(1500);
+            
+            // 재시도 메뉴 표시
+            if (showRetryMenu()) {
+              // 같은 맵으로 재시작
+              playerHp = savedHp;
+              hintCount = savedHintCount;
+              isUltraMode = savedUltraMode;
+              updateHpLeds();
+            } else {
+              // 메인 메뉴로 돌아가기
+              mazeGenerated = false;
+            }
+          } else {
+            // 시작점으로 복귀
+            playerX = 1;
+            playerY = 1;
+            oldX = 1;
+            oldY = 1;
+            display.clearDisplay();
+            display.display();
+            delay(500);
+          }
+        } else if (maze[nextY][nextX] == '3') {
+          // 골 도달
+          clearTime = (millis() - startTime) / 1000;
+          display.clearDisplay();
+          display.setTextSize(2);
+          display.setCursor(15, 10);
+          display.println(F("CLEAR!"));
+          display.setTextSize(1);
+          display.setCursor(20, 40);
+          display.print(F("Time: "));
+          display.print(clearTime);
+          display.print(F(" sec"));
+          display.display();
+          
+          tone(BUZZER_PIN, 523, 100);
+          delay(100);
+          tone(BUZZER_PIN, 659, 100);
+          delay(100);
+          tone(BUZZER_PIN, 784, 300);
+          delay(2000);
+          gameActive = false;
+          mazeGenerated = false; // 클리어 후 새 맵 생성
+        } else {
+          // 정상 이동
+          playerX = nextX;
+          playerY = nextY;
+        }
+        lastMoveTime = now;
+      }
+    }
+
+    // 힌트 버튼 (ULTRA 모드에서는 힌트 불가)
+    if (digitalRead(HINT_BUTTON_PIN) == HIGH && hintCount > 0) {
+      delay(200); // 디바운싱
+      hintCount--;
+      drawFullMaze();
+      delay(1500);
+      display.clearDisplay();
+      display.display();
+      lastDisplayUpdate = now;
+    }
+  }
+}

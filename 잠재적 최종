@@ -95,7 +95,7 @@ else
   display.println(F("> Extreme (HP1, Hint0)"));
     display.display();
 
-    if (digitalRead(HINT_BUTTON_PIN) == LOW) {
+    if (digitalRead(HINT_BUTTON_PIN) == HIGH) {
       delay(200); // 버튼 디바운싱
       if (selection == 1) {
         playerHp = 5;
@@ -239,7 +239,7 @@ void loop() {
   unsigned long now = millis();
   
   // 리셋 버튼 체크
-  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+  if (digitalRead(RESET_BUTTON_PIN) == HIGH) {
     delay(200);
     gameActive = false;
     isBlindMode = false;
@@ -403,7 +403,7 @@ void loop() {
     }
 
     // 힌트 버튼 (ULTRA 모드에서는 힌트 불가)
-    if (digitalRead(HINT_BUTTON_PIN) == LOW && hintCount > 0) {
+    if (digitalRead(HINT_BUTTON_PIN) == HIGH && hintCount > 0) {
       delay(200); // 디바운싱
       hintCount--;
       drawFullMaze();
